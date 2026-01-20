@@ -1,3 +1,5 @@
+import { DOMSubscriber } from "https://cdn.pagelove.net/js/dom-subscriber/cde4007/index.mjs";
+
 function generateSelector( ) {
     try {
         // If element has an ID, use it as the selector for stability
@@ -128,7 +130,7 @@ async function OPTIONS( aPLDocument ) {
             if ( part.headers['content-range'] ) {
                 const selector = part.headers['content-range'].split(/=/)[1];                
                 const doc = await aPLDocument.document;
-                doc.querySelectorAll(selector).forEach( node => {
+                DOMSubscriber.subscribe( doc, selector, (node) => {
                     const anEvent = new CustomEvent('PLCapability', {
                         detail: {
                             selector: selector,
