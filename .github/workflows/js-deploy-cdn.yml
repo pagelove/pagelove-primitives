@@ -1,0 +1,235 @@
+name: Deploy to CDN
+
+# Generic deployment workflow for Pagelove JavaScript modules
+# Copy this file to .github/workflows/deploy-cdn.yml in any module repo
+# Module name is auto-detected from the repository name
+#
+# Uploads on:
+#   - Commits: https://cdn.pagelove.net/js/<module>/<7-char-hash>/index.mjs
+#   - Tags:    https://cdn.pagelove.net/js/<module>/1.0.1/index.mjs (v prefix stripped)
+#
+# All paths are 2 levels deep, so peer imports use: ../../<peer-module>/<version>/index.mjs
+#
+# Required GitHub environment: prod
+# Environment secrets (configured via Terraform):
+#   - AZURE_CLIENT_ID
+#   - AZURE_TENANT_ID
+#   - AZURE_SUBSCRIPTION_ID
+#   - AZURE_STORAGE_ACCOUNT
+#   - AZURE_STORAGE_CONTAINER
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+env:
+  AZURE_STORAGE_ACCOUNT: ${{ secrets.AZURE_STORAGE_ACCOUNT }}
+  AZURE_STORAGE_CONTAINER: ${{ secrets.AZURE_STORAGE_CONTAINER }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: prod
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Detect module name
+        id: module
+        run: |
+          # Extract module name from repository name (e.g., pagelove/dom-subscriber -> dom-subscriber)
+          MODULE_NAME="${GITHUB_REPOSITORY#*/}"
+          echo "name=$MODULE_NAME" >> $GITHUB_OUTPUT
+          echo "Detected module name: $MODULE_NAME"
+
+      - name: Install Azure CLI
+        run: |
+          if ! command -v az &> /dev/null; then
+            curl -sL https://aka.ms/InstallAzureCLIDeb | sudo bash
+          fi
+
+      - name: Azure login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Determine deployment paths
+        id: paths
+        run: |
+          # 7-character git SHA for commit-based deployments (no prefix, just the hash)
+          SHA="${GITHUB_SHA:0:7}"
+          echo "sha=$SHA" >> $GITHUB_OUTPUT
+          echo "sha_path=$SHA" >> $GITHUB_OUTPUT
+
+          # Handle tagged versions (e.g., v1.0.1 -> 1.0.1, strip the 'v' prefix)
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            VERSION_WITH_V="${GITHUB_REF#refs/tags/}"
+            VERSION="${VERSION_WITH_V#v}"  # Strip 'v' prefix
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "version_path=$VERSION" >> $GITHUB_OUTPUT
+            echo "is_tag=true" >> $GITHUB_OUTPUT
+          else
+            echo "is_tag=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate Azure storage config
+        run: |
+          set -euo pipefail
+          if [[ -z "${AZURE_STORAGE_ACCOUNT:-}" ]]; then
+            echo "Error: AZURE_STORAGE_ACCOUNT secret is missing" >&2
+            exit 1
+          fi
+          if [[ -z "${AZURE_STORAGE_CONTAINER:-}" ]]; then
+            echo "Error: AZURE_STORAGE_CONTAINER secret is missing" >&2
+            exit 1
+          fi
+          if [[ -z "${{ secrets.AZURE_CLIENT_ID }}" || -z "${{ secrets.AZURE_TENANT_ID }}" || -z "${{ secrets.AZURE_SUBSCRIPTION_ID }}" ]]; then
+            echo "Error: Azure federated credentials (AZURE_CLIENT_ID/AZURE_TENANT_ID/AZURE_SUBSCRIPTION_ID) are missing" >&2
+            exit 1
+          fi
+          echo "✓ Azure storage configuration validated"
+
+      - name: Prepare files for deployment
+        run: |
+          set -euo pipefail
+
+          # Create dist directory
+          mkdir -p dist
+
+          # Find and copy all .mjs files (excluding node_modules, .git, .github)
+          find . -name "*.mjs" -type f \
+            -not -path "./node_modules/*" \
+            -not -path "./.git/*" \
+            -not -path "./.github/*" \
+            -not -path "./dist/*" | while read -r file; do
+
+            # Remove leading ./
+            rel_path="${file#./}"
+
+            # Create directory structure in dist
+            mkdir -p "dist/$(dirname "$rel_path")"
+
+            echo "Copying: $rel_path"
+            cp "$file" "dist/$rel_path"
+          done
+
+          # Count files to deploy
+          FILE_COUNT=$(find dist -name "*.mjs" -type f | wc -l)
+          echo "Prepared $FILE_COUNT file(s) for deployment"
+
+          if [[ $FILE_COUNT -eq 0 ]]; then
+            echo "Error: No .mjs files found to deploy" >&2
+            exit 1
+          fi
+
+      - name: Deploy to CDN
+        run: |
+          set -euo pipefail
+
+          MODULE_NAME="${{ steps.module.outputs.name }}"
+          SHA="${{ steps.paths.outputs.sha }}"
+          SHA_PATH="${{ steps.paths.outputs.sha_path }}"
+          IS_TAG="${{ steps.paths.outputs.is_tag }}"
+          VERSION="${{ steps.paths.outputs.version }}"
+          VERSION_PATH="${{ steps.paths.outputs.version_path }}"
+
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "📦 Deploying $MODULE_NAME to CDN"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+          # Upload function with appropriate cache headers
+          upload_to_path() {
+            local dest_path=$1
+            local cache_control=$2
+            local description=$3
+
+            echo ""
+            echo "Uploading to: /js/$MODULE_NAME/$dest_path ($description)"
+
+            az storage blob upload-batch \
+              --account-name "$AZURE_STORAGE_ACCOUNT" \
+              --auth-mode login \
+              --destination "$AZURE_STORAGE_CONTAINER" \
+              --destination-path "js/$MODULE_NAME/$dest_path" \
+              --source dist \
+              --pattern "*.mjs" \
+              --overwrite \
+              --content-type "application/javascript" \
+              --content-cache-control "$cache_control"
+
+            echo "✓ Uploaded to: https://cdn.pagelove.net/js/$MODULE_NAME/$dest_path/"
+          }
+
+          # Always upload to git SHA path (immutable, no /sha/ prefix)
+          upload_to_path "$SHA_PATH" "public, max-age=31536000, immutable" "commit SHA (immutable)"
+
+          # Upload to version path if this is a tagged release (v prefix stripped)
+          if [[ "$IS_TAG" == "true" ]]; then
+            upload_to_path "$VERSION_PATH" "public, max-age=31536000, immutable" "semver release (immutable)"
+          fi
+
+          echo ""
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+          echo "✅ Deployment Complete"
+          echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+
+      - name: Generate deployment summary
+        run: |
+          MODULE_NAME="${{ steps.module.outputs.name }}"
+          SHA="${{ steps.paths.outputs.sha }}"
+          IS_TAG="${{ steps.paths.outputs.is_tag }}"
+          VERSION="${{ steps.paths.outputs.version }}"
+
+          echo "## CDN Deployment Complete: $MODULE_NAME" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Git SHA:** $SHA" >> $GITHUB_STEP_SUMMARY
+
+          if [[ "$IS_TAG" == "true" ]]; then
+            echo "**Version:** $VERSION" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### CDN URLs" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          # Find index.mjs (preferred) or first .mjs file as example
+          if [ -f "dist/index.mjs" ]; then
+            EXAMPLE_FILE="dist/index.mjs"
+          else
+            EXAMPLE_FILE=$(find dist -name "*.mjs" -type f | head -n 1)
+          fi
+
+          if [[ -n "$EXAMPLE_FILE" ]]; then
+            EXAMPLE_PATH="${EXAMPLE_FILE#dist/}"
+
+            echo "**Commit-based import (this deployment):**" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`javascript" >> $GITHUB_STEP_SUMMARY
+            echo "import 'https://cdn.pagelove.net/js/$MODULE_NAME/$SHA/$EXAMPLE_PATH';" >> $GITHUB_STEP_SUMMARY
+            echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+
+            if [[ "$IS_TAG" == "true" ]]; then
+              echo "**Semver import (immutable release):**" >> $GITHUB_STEP_SUMMARY
+              echo "\`\`\`javascript" >> $GITHUB_STEP_SUMMARY
+              echo "import 'https://cdn.pagelove.net/js/$MODULE_NAME/$VERSION/$EXAMPLE_PATH';" >> $GITHUB_STEP_SUMMARY
+              echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+              echo "" >> $GITHUB_STEP_SUMMARY
+            fi
+          fi
+
+          echo "**All deployed files:**" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          find dist -name "*.mjs" -type f | while read -r file; do
+            rel_path="${file#dist/}"
+            echo "- \`$rel_path\`" >> $GITHUB_STEP_SUMMARY
+          done
