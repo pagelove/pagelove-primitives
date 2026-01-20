@@ -237,7 +237,8 @@ class PLDocument {
     #document;
 
     constructor( url ) {
-        this.url = url;
+        if (!url) url = window.location.href;
+        this.url = url;        
 
         if ( this.url === window.location.href ) {
             this.document = window.document;
