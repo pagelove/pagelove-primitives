@@ -208,11 +208,10 @@ class PLElement {
     }
 
     async DELETE() {
-        const response = this.#processRequest( this.req('DELETE') );
+        const response = await this.#processRequest( this.req('DELETE') );
         if ( response.ok ) this.element.remove();
         else {
             console.log(`DELETE request failed with status ${response.status}`);
-            console.log( response );
         }
         return response;
     }
@@ -232,7 +231,7 @@ class PLElement {
     async PUT( body ) {
         if ( !body ) body = this.element.outerHTML;
         else if ( body instanceof Node ) body = body.outerHTML;
-        return this.#processRequest( this.req('PUT', { body }) );
+        return await this.#processRequest( this.req('PUT', { body }) );
     }    
 }
 
