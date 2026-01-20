@@ -212,6 +212,7 @@ class PLElement {
         if ( response.ok ) this.element.remove();
         else {
             console.log(`DELETE request failed with status ${response.status}`);
+            console.log( response );
         }
         return response;
     }
