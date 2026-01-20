@@ -210,6 +210,9 @@ class PLElement {
     async DELETE() {
         const response = this.#processRequest( this.req('DELETE') );
         if ( response.ok ) this.element.remove();
+        else {
+            console.log(`DELETE request failed with status ${response.status}`);
+        }
         return response;
     }
 
